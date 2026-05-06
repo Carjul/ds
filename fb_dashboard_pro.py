@@ -10,6 +10,8 @@ Usage:
 
 import json, os, requests, concurrent.futures, threading, time as _time
 from datetime import datetime
+from typing import Any
+from urllib.parse import urlparse
 from flask import Flask, render_template_string, jsonify, request as flask_request
 
 # ============================================================
@@ -17,7 +19,7 @@ from flask import Flask, render_template_string, jsonify, request as flask_reque
 # ============================================================
 BM1_TOKEN = os.environ.get("BM1_TOKEN", "YOUR_BM1_TOKEN_HERE")
 BM2_TOKEN = os.environ.get("BM2_TOKEN", "YOUR_BM2_TOKEN_HERE")
-PORT = int(os.environ.get("PORT", 5000)) 
+PORT = int(os.environ.get("PORT", 5001))
 
 API_VERSION = "v21.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}/"
@@ -204,7 +206,7 @@ def fetch_campaigns(account_id, bm, date_preset):
 # ============================================================
 # AUTO REPORT (7:55 AM EST)
 # ============================================================
-report_cache = {"data": None, "generated_at": None}
+report_cache: dict[str, Any] = {"data": None, "generated_at": None}
 
 def generate_report():
     if LIVE_MODE:
@@ -222,6 +224,44 @@ def report_scheduler():
             generate_report()
             _time.sleep(61)
         _time.sleep(30)
+
+# ============================================================
+# FEEDBACK MANAGEMENT
+# ============================================================
+FEEDBACK_FILE = "feedback.json"
+CREATIVE_LINKS: dict[str, str] = {}
+
+def is_valid_http_url(url):
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+def load_feedbacks():
+    try:
+        if os.path.exists(FEEDBACK_FILE):
+            with open(FEEDBACK_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return {"feedbacks": []}
+
+def save_feedbacks(data):
+    try:
+        with open(FEEDBACK_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except:
+        return False
+
+def get_feedback_id():
+    import time as t
+    return f"fb_{int(t.time())}_{len(load_feedbacks()['feedbacks'])}"
+
+def get_response_id():
+    import time as t
+    return f"resp_{int(t.time())}_{len([r for fb in load_feedbacks()['feedbacks'] for r in fb.get('responses', [])])}"
 
 # ============================================================
 # FLASK
@@ -245,7 +285,7 @@ def api_data(period):
 
 @app.route("/api/campaigns")
 def api_campaigns():
-    account_id = flask_request.args.get("account_id")
+    account_id = flask_request.args.get("account_id") or ""
     bm = flask_request.args.get("bm")
     period = flask_request.args.get("period", "today")
     preset = DATE_MAP.get(period, "today")
@@ -261,6 +301,111 @@ def api_report():
     if report_cache["data"]:
         return jsonify({"data": report_cache["data"], "generated_at": report_cache["generated_at"]})
     return jsonify({"data": None, "generated_at": None})
+
+@app.route("/api/creative-links", methods=["GET"])
+def get_creative_links():
+    return jsonify(CREATIVE_LINKS)
+
+@app.route("/api/creative-links", methods=["POST"])
+def upsert_creative_link():
+    payload = flask_request.json or {}
+    name = (payload.get("name") or "").strip()
+    url = (payload.get("url") or "").strip()
+
+    if not name:
+        return jsonify({"error": "Campaign name is required"}), 400
+
+    if not url:
+        if name in CREATIVE_LINKS:
+            del CREATIVE_LINKS[name]
+        return jsonify({"name": name, "deleted": True}), 200
+
+    if not is_valid_http_url(url):
+        return jsonify({"error": "Invalid URL. Use http:// or https://"}), 400
+
+    CREATIVE_LINKS[name] = url
+    return jsonify({"name": name, "url": url}), 200
+
+# ============================================================
+# FEEDBACK API
+# ============================================================
+@app.route("/api/feedback", methods=["GET"])
+def get_feedbacks():
+    data = load_feedbacks()
+    return jsonify(data["feedbacks"])
+
+@app.route("/api/feedback", methods=["POST"])
+def create_feedback():
+    content = flask_request.json.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "Empty feedback"}), 400
+    
+    data = load_feedbacks()
+    new_fb = {
+        "id": get_feedback_id(),
+        "content": content,
+        "created_at": datetime.now().isoformat(),
+        "status": "open",
+        "responses": []
+    }
+    data["feedbacks"].insert(0, new_fb)
+    save_feedbacks(data)
+    return jsonify(new_fb), 201
+
+@app.route("/api/feedback/<fb_id>", methods=["PATCH"])
+def edit_feedback(fb_id):
+    content = flask_request.json.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "Empty feedback"}), 400
+
+    data = load_feedbacks()
+    for fb in data["feedbacks"]:
+        if fb["id"] == fb_id:
+            fb["content"] = content
+            fb["updated_at"] = datetime.now().isoformat()
+            save_feedbacks(data)
+            return jsonify(fb), 200
+
+    return jsonify({"error": "Feedback not found"}), 404
+
+@app.route("/api/feedback/<fb_id>/response", methods=["POST"])
+def add_response(fb_id):
+    content = flask_request.json.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "Empty response"}), 400
+    
+    data = load_feedbacks()
+    for fb in data["feedbacks"]:
+        if fb["id"] == fb_id:
+            new_resp = {
+                "id": get_response_id(),
+                "content": content,
+                "created_at": datetime.now().isoformat()
+            }
+            fb["responses"].append(new_resp)
+            save_feedbacks(data)
+            return jsonify(new_resp), 201
+    
+    return jsonify({"error": "Feedback not found"}), 404
+
+@app.route("/api/feedback/<fb_id>/status", methods=["PATCH"])
+def update_status(fb_id):
+    status = flask_request.json.get("status", "open")
+    data = load_feedbacks()
+    for fb in data["feedbacks"]:
+        if fb["id"] == fb_id:
+            fb["status"] = status
+            save_feedbacks(data)
+            return jsonify({"status": status}), 200
+    
+    return jsonify({"error": "Feedback not found"}), 404
+
+@app.route("/api/feedback/<fb_id>/delete", methods=["DELETE"])
+def delete_feedback(fb_id):
+    data = load_feedbacks()
+    data["feedbacks"] = [fb for fb in data["feedbacks"] if fb["id"] != fb_id]
+    save_feedbacks(data)
+    return jsonify({"deleted": True}), 200
 
 
 HTML = r"""
@@ -347,7 +492,14 @@ tr.camp-row td{padding:10px 14px;font-size:12px;color:var(--text);letter-spacing
 tr.camp-row td.num{font-size:12px;font-variant-numeric:tabular-nums}
 tr.camp-row td:first-child{padding-left:44px}
 .camp-name{font-weight:600;max-width:320px;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:var(--accent)}
+.camp-name.clickable{cursor:pointer}
+.camp-name.clickable:hover{text-decoration:underline}
 .camp-loader{text-align:center;padding:12px;color:var(--text3);font-size:12px}
+
+.creative-link{display:inline-block;max-width:240px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;color:var(--accent);text-decoration:none}
+.creative-link:hover{text-decoration:underline}
+.creative-action{font-size:11px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text2);cursor:pointer;margin-left:8px}
+.creative-action:hover{border-color:var(--accent);color:var(--accent)}
 
 tfoot tr{border-top:2px solid var(--border);font-weight:700;font-size:13px;background:var(--bg)}
 tfoot td{padding:12px 12px}
@@ -363,7 +515,55 @@ tfoot td.num{text-align:right;font-variant-numeric:tabular-nums}
 .report-badge{display:none;font-size:10px;padding:2px 8px;border-radius:4px;font-weight:600;background:rgba(34,197,94,.15);color:var(--green);cursor:pointer}
 .report-badge.show{display:inline-flex;align-items:center;gap:4px}
 
-@media(max-width:900px){.sgrid{grid-template-columns:repeat(2,1fr)}.header{padding:12px 16px;flex-wrap:wrap;gap:10px}.ctn{padding:16px}}
+.feedback-btn{background:var(--accent);color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;margin:16px 0 16px auto;display:block}
+.feedback-btn:hover{opacity:.9;transform:translateY(-2px)}
+
+.modal-backdrop{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:1000;animation:fadeIn .2s}
+.modal-backdrop.show{display:flex;align-items:center;justify-content:center}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+.modal-content{background:var(--bg2);border:1px solid var(--border);border-radius:12px;width:90%;max-width:500px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.3);animation:slideUp .3s}
+@keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.modal-content h3{margin-bottom:16px;font-size:16px;color:var(--text)}
+.modal-content textarea{width:100%;min-height:100px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-family:inherit;resize:vertical}
+.modal-content textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,130,246,.1)}
+.modal-buttons{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
+.modal-btn{padding:8px 16px;border-radius:8px;border:none;font-weight:600;cursor:pointer;transition:all .2s;font-size:13px}
+.modal-btn.submit{background:var(--accent);color:#fff}
+.modal-btn.submit:hover{opacity:.9}
+.modal-btn.cancel{background:var(--border);color:var(--text3)}
+.modal-btn.cancel:hover{color:var(--text);border-color:var(--accent)}
+
+.feedback-canvas{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px;margin:20px auto;box-shadow:var(--card-shadow);max-width:1400px}
+.feedback-canvas h3{margin-bottom:16px;font-size:14px;font-weight:600}
+.feedback-list{display:flex;flex-direction:column;gap:12px;max-height:400px;overflow-y:auto}
+.feedback-item{background:var(--bg);border-left:3px solid var(--accent);border-radius:6px;padding:12px 14px;transition:all .2s}
+.feedback-item.resolved{border-left-color:var(--green);opacity:.7}
+.feedback-item:hover{border-left-color:var(--yellow)}
+.feedback-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:12px;color:var(--text3)}
+.feedback-time{font-size:10px}
+.fb-status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.fb-status.open{background:rgba(59,130,246,.15);color:var(--accent)}
+.fb-status.resolved{background:rgba(34,197,94,.15);color:var(--green)}
+.feedback-text{font-size:13px;color:var(--text);line-height:1.4;margin-bottom:8px}
+.feedback-actions{display:flex;gap:6px;flex-wrap:wrap}
+.fb-action{font-size:11px;padding:4px 10px;background:var(--border);border:none;border-radius:4px;color:var(--text3);cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:4px}
+.fb-action svg{width:14px;height:14px}
+.fb-action:hover{filter:brightness(1.06)}
+.reply-btn{background:rgba(59,130,246,.16);color:#93c5fd}
+.resolve-btn{background:rgba(34,197,94,.16);color:#86efac}
+.delete-btn{background:rgba(239,68,68,.16);color:#fca5a5;display:none}
+.edit-btn{background:rgba(245,158,11,.16);color:#fcd34d}
+body.show-delete .delete-btn{display:flex}
+.feedback-actions .edit-btn{margin-left:auto}
+.response-section{margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
+.response-item{background:var(--bg2);padding:10px 12px;border-left:2px solid var(--yellow);border-radius:4px;margin-bottom:6px;font-size:12px}
+.response-meta{font-size:10px;color:var(--text3);margin-bottom:4px}
+.response-text{color:var(--text2);font-style:italic}
+.feedback-text,.response-text,.response-item{overflow-wrap:anywhere;word-break:break-word}
+.empty-feedback{text-align:center;padding:30px 20px;color:var(--text3);font-size:13px}
+
+@media(max-width:900px){.sgrid{grid-template-columns:repeat(2,1fr)}.header{padding:12px 16px;flex-wrap:wrap;gap:10px}.ctn{padding:16px}.feedback-item{padding:10px}.feedback-header{flex-wrap:wrap;gap:6px}.feedback-text{font-size:12px;line-height:1.45}.feedback-actions{gap:5px}.fb-action{font-size:10px;padding:4px 8px;max-width:100%}}
 </style>
 </head>
 <body>
@@ -428,11 +628,54 @@ tfoot td.num{text-align:right;font-variant-numeric:tabular-nums}
           <th class="num" data-col="unique_link_ctr">U-CTR <span class="arrow"></span></th>
           <th class="num" data-col="checkouts">IC <span class="arrow"></span></th>
           <th class="num" data-col="cost_checkout">$/IC <span class="arrow"></span></th>
+          <th>Creative</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
       <tfoot id="tfoot"></tfoot>
     </table>
+    </div>
+  </div>
+</div>
+
+<div class="feedback-canvas">
+  <h3>📝 Feedback & Responses</h3>
+  <div class="feedback-list" id="feedbackList">
+    <div class="empty-feedback">No feedback yet. Be the first to share!</div>
+  </div>
+  <button class="feedback-btn" onclick="openFeedbackModal()">💬 Send Feedback</button>
+</div>
+
+<div class="modal-backdrop" id="feedbackModal">
+  <div class="modal-content">
+    <h3 id="feedbackModalTitle">Send Feedback</h3>
+    <textarea id="feedbackText" placeholder="Share your feedback..."></textarea>
+    <div class="modal-buttons">
+      <button class="modal-btn cancel" onclick="closeFeedbackModal()">Cancel</button>
+      <button class="modal-btn submit" id="feedbackSubmitBtn" onclick="submitFeedback()">Send</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="responseModal">
+  <div class="modal-content">
+    <h3>Add Response</h3>
+    <textarea id="responseText" placeholder="Write your response..."></textarea>
+    <div class="modal-buttons">
+      <button class="modal-btn cancel" onclick="closeResponseModal()">Cancel</button>
+      <button class="modal-btn submit" onclick="submitResponse()">Send</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="creativeModal">
+  <div class="modal-content">
+    <h3>Creative URL</h3>
+    <div style="font-size:12px;color:var(--text3);margin-bottom:10px">Campaign: <strong id="creativeCampaignName" style="color:var(--text)"></strong></div>
+    <textarea id="creativeUrlInput" placeholder="https://example.com/creative" style="min-height:70px"></textarea>
+    <div class="modal-buttons">
+      <button class="modal-btn cancel" onclick="closeCreativeModal()">Cancel</button>
+      <button class="modal-btn submit" onclick="submitCreativeLink()">Save</button>
     </div>
   </div>
 </div>
@@ -446,6 +689,7 @@ const fmt = n => "$"+n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFr
 const fmtK = n => n>=1000000?(n/1000000).toFixed(1)+"M":n>=1000?(n/1000).toFixed(1)+"K":n.toLocaleString();
 
 let rows=[], sortCol="spend", sortAsc=false, currentPeriod="today", expandedAcct=null, campCache={};
+let creativeLinksByName={}, currentCreativeCampaignName=null;
 
 $$(".date-b").forEach(b=>b.addEventListener("click",()=>{
   $$(".date-b").forEach(x=>x.classList.remove("active"));
@@ -454,7 +698,7 @@ $$(".date-b").forEach(b=>b.addEventListener("click",()=>{
   doLoad(b.dataset.period);
 }));
 
-$$("thead th").forEach(th=>th.addEventListener("click",()=>{
+$$('thead th[data-col]').forEach(th=>th.addEventListener("click",()=>{
   const col=th.dataset.col;
   if(sortCol===col)sortAsc=!sortAsc;else{sortCol=col;sortAsc=col==="name";}
   renderTable();
@@ -492,7 +736,7 @@ function renderTable(){
 
   $("#aCnt").textContent=rows.length+" active account"+(rows.length!==1?"s":"");
 
-  $$("thead th").forEach(th=>{
+  $$("thead th[data-col]").forEach(th=>{
     const arrow=th.querySelector(".arrow");
     if(th.dataset.col===sortCol){arrow.textContent=sortAsc?" ▲":" ▼";th.classList.add("sorted");}
     else{arrow.textContent="";th.classList.remove("sorted");}
@@ -515,20 +759,26 @@ function renderTable(){
       <td class="num">${(r.unique_link_ctr||0).toFixed(2)}%</td>
       <td class="num ${r.checkouts===0?'zero':''}">${r.checkouts}</td>
       <td class="num ${r.cost_checkout>0?'':'zero'}">${r.cost_checkout>0?fmt(r.cost_checkout):'—'}</td>
+      <td class="zero">-</td>
     </tr>`;
     if(isOpen){
       const camps=campCache[r.id];
       if(!camps){
-        html+=`<tr class="camp-row"><td colspan="13" class="camp-loader"><div class="spin" style="width:16px;height:16px;border-width:2px"></div> Loading campaigns...</td></tr>`;
+        html+=`<tr class="camp-row"><td colspan="14" class="camp-loader"><div class="spin" style="width:16px;height:16px;border-width:2px"></div> Loading campaigns...</td></tr>`;
       } else if(camps.length===0){
-        html+=`<tr class="camp-row"><td colspan="13" class="camp-loader">No active campaigns</td></tr>`;
+        html+=`<tr class="camp-row"><td colspan="14" class="camp-loader">No active campaigns</td></tr>`;
       } else {
         camps.forEach(c=>{
+          const encodedCampName=encodeURIComponent(c.name||"");
+          const creativeUrl=creativeLinksByName[c.name]||"";
+          const creativeCell=creativeUrl
+            ? `<a class="creative-link" href="${escapeHtml(creativeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(creativeUrl)}</a><button class="creative-action creative-edit-btn" data-camp-name="${encodedCampName}">Edit</button>`
+            : `<button class="creative-action creative-add-btn" data-camp-name="${encodedCampName}">Add</button>`;
           const cp=c.purchases>0?c.spend/c.purchases:null;
           const cr=c.spend>0?((c.revenue-c.spend)/c.spend)*100:null;
           const pf=c.revenue-c.spend;
           html+=`<tr class="camp-row">
-            <td><div class="camp-name">${c.name}</div></td>
+            <td><div class="camp-name clickable camp-name-clickable" data-camp-name="${encodedCampName}">${escapeHtml(c.name||"")}</div></td>
             <td class="num ${c.purchases===0?'zero':''}">${c.purchases||0}</td>
             <td class="num">${fmt(c.spend)}</td>
             <td class="num ${c.revenue>0?'vg':'zero'}">${fmt(c.revenue)}</td>
@@ -541,12 +791,14 @@ function renderTable(){
             <td class="num">${(c.unique_link_ctr||0).toFixed(2)}%</td>
             <td class="num ${(c.checkouts||0)===0?'zero':''}">${c.checkouts||0}</td>
             <td class="num ${(c.cost_checkout||0)>0?'':'zero'}">${(c.cost_checkout||0)>0?fmt(c.cost_checkout):'—'}</td>
+            <td>${creativeCell}</td>
           </tr>`;
         });
       }
     }
   });
   $("#tbody").innerHTML=html;
+  attachCreativeListeners();
 
   const ts=rows.reduce((s,r)=>s+r.spend,0);
   const tr=rows.reduce((s,r)=>s+r.revenue,0);
@@ -577,6 +829,7 @@ function renderTable(){
     <td class="num">${tUCTR.toFixed(2)}%</td>
     <td class="num">${tc.toLocaleString()}</td>
     <td class="num">${tCostCO>0?fmt(tCostCO):'—'}</td>
+    <td class="zero">-</td>
   </tr>`;
 }
 
@@ -590,6 +843,58 @@ function toggleCamps(acctId, bm){
       .then(data=>{campCache[acctId]=data;renderTable();})
       .catch(()=>{campCache[acctId]=[];renderTable();});
   }
+}
+
+function loadCreativeLinks(){
+  fetch("/api/creative-links")
+    .then(r=>r.json())
+    .then(data=>{
+      creativeLinksByName=data||{};
+      if(rows.length)renderTable();
+    })
+    .catch(()=>{});
+}
+
+function attachCreativeListeners(){
+  $$(".camp-name-clickable").forEach(el=>el.addEventListener("click",e=>{
+    const campName=decodeURIComponent(e.currentTarget.dataset.campName||"");
+    openCreativeModal(campName);
+  }));
+  $$(".creative-add-btn,.creative-edit-btn").forEach(btn=>btn.addEventListener("click",e=>{
+    const campName=decodeURIComponent(e.currentTarget.dataset.campName||"");
+    openCreativeModal(campName);
+  }));
+}
+
+function openCreativeModal(campaignName){
+  currentCreativeCampaignName=campaignName;
+  $("#creativeCampaignName").textContent=campaignName;
+  $("#creativeUrlInput").value=creativeLinksByName[campaignName]||"";
+  $("#creativeModal").classList.add("show");
+}
+
+function closeCreativeModal(){
+  $("#creativeModal").classList.remove("show");
+  currentCreativeCampaignName=null;
+}
+
+function submitCreativeLink(){
+  if(!currentCreativeCampaignName)return;
+  const url=$("#creativeUrlInput").value.trim();
+  fetch("/api/creative-links",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name:currentCreativeCampaignName,url})
+  })
+    .then(async r=>{
+      const data=await r.json();
+      if(!r.ok)throw new Error(data.error||"Could not save URL");
+      if(data.deleted)delete creativeLinksByName[currentCreativeCampaignName];
+      else creativeLinksByName[currentCreativeCampaignName]=data.url;
+      renderTable();
+      closeCreativeModal();
+    })
+    .catch(e=>alert(e.message||"Could not save URL"));
 }
 
 // ---- Refresh ----
@@ -636,6 +941,150 @@ function finish(){
   $$(".date-b").forEach(b=>b.disabled=false);
   updateTimestamp();
 }
+
+// ---- FEEDBACK SYSTEM ----
+let feedbacks=[], currentResponseFbId=null, currentEditingFbId=null, deleteButtonsVisible=false;
+
+function openFeedbackModal(){
+  currentEditingFbId=null;
+  $("#feedbackModalTitle").textContent="Send Feedback";
+  $("#feedbackSubmitBtn").textContent="Send";
+  $("#feedbackText").value="";
+  $("#feedbackModal").classList.add("show");
+}
+
+function openEditFeedbackModal(fbId){
+  const target=feedbacks.find(fb=>fb.id===fbId);
+  if(!target)return;
+  currentEditingFbId=fbId;
+  $("#feedbackModalTitle").textContent="Edit Feedback";
+  $("#feedbackSubmitBtn").textContent="Save";
+  $("#feedbackText").value=target.content||"";
+  $("#feedbackModal").classList.add("show");
+}
+
+function closeFeedbackModal(){
+  $("#feedbackModal").classList.remove("show");
+  currentEditingFbId=null;
+}
+
+function closeResponseModal(){
+  $("#responseModal").classList.remove("show");
+  currentResponseFbId=null;
+}
+
+function submitFeedback(){
+  const text=$("#feedbackText").value.trim();
+  if(!text){alert("Please write a feedback message");return;}
+  const endpoint=currentEditingFbId?`/api/feedback/${currentEditingFbId}`:"/api/feedback";
+  const method=currentEditingFbId?"PATCH":"POST";
+  fetch(endpoint,{method,headers:{"Content-Type":"application/json"},body:JSON.stringify({content:text})})
+    .then(r=>r.json())
+    .then(()=>{loadFeedbacks();closeFeedbackModal();})
+    .catch(e=>console.error(e));
+}
+
+function loadFeedbacks(){
+  fetch("/api/feedback").then(r=>r.json()).then(data=>{feedbacks=data||[];renderFeedbacks();}).catch(()=>{});
+}
+
+function renderFeedbacks(){
+  const list=$("#feedbackList");
+  if(feedbacks.length===0){list.innerHTML='<div class="empty-feedback">No feedback yet. Be the first to share!</div>';return;}
+  list.innerHTML=feedbacks.map(fb=>{
+    const time=new Date(fb.created_at).toLocaleString();
+    const isResolved=fb.status==="resolved";
+    let respHtml="";
+    if(fb.responses&&fb.responses.length>0){
+      respHtml+=`<div class="response-section"><strong style="font-size:11px;color:var(--text3)">Responses:</strong>`;
+      fb.responses.forEach(r=>{
+        const rtime=new Date(r.created_at).toLocaleString();
+        respHtml+=`<div class="response-item"><div class="response-meta">${rtime}</div><div class="response-text">${escapeHtml(r.content)}</div></div>`;
+      });
+      respHtml+="</div>";
+    }
+    return `<div class="feedback-item ${isResolved?'resolved':''}">
+      <div class="feedback-header">
+        <span class="feedback-time">${time}</span>
+        <span class="fb-status ${isResolved?'resolved':'open'}">${isResolved?'Resolved':'Open'}</span>
+      </div>
+      <div class="feedback-text">${escapeHtml(fb.content)}</div>
+      <div class="feedback-actions">
+        <button class="fb-action reply-btn" data-fb-id="${fb.id}" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 15 16 10 21 5"/><path d="M21 15H9a6 6 0 01-6-6V3"/></svg>Reply</button>
+        <button class="fb-action resolve-btn" data-fb-id="${fb.id}" data-status="${isResolved?'open':'resolved'}" title="Toggle Status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0016.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 002 8.5c0 2.3 1.5 4.05 3 5.5"/></svg>${isResolved?'Reopen':'Resolve'}</button>
+        <button class="fb-action edit-btn" data-fb-id="${fb.id}" title="Edit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 113 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>Edit</button>
+        <button class="fb-action delete-btn" data-fb-id="${fb.id}" title="Delete (press D)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>Delete</button>
+      </div>
+      ${respHtml}
+    </div>`;
+  }).join("");
+  attachFeedbackListeners();
+}
+
+function attachFeedbackListeners(){
+  $$(".reply-btn").forEach(btn=>{btn.addEventListener("click",e=>{const fbId=e.currentTarget.dataset.fbId;openResponseModal(fbId);});});
+  $$(".edit-btn").forEach(btn=>{btn.addEventListener("click",e=>{const fbId=e.currentTarget.dataset.fbId;openEditFeedbackModal(fbId);});});
+  $$(".resolve-btn").forEach(btn=>{btn.addEventListener("click",e=>{const fbId=e.currentTarget.dataset.fbId;const status=e.currentTarget.dataset.status;toggleStatus(fbId,status);});});
+  $$(".delete-btn").forEach(btn=>{btn.addEventListener("click",e=>{const fbId=e.currentTarget.dataset.fbId;deleteFeedback(fbId);});});
+}
+
+function openResponseModal(fbId){
+  currentResponseFbId=fbId;
+  $("#responseText").value="";
+  $("#responseModal").classList.add("show");
+}
+
+function submitResponse(){
+  if(!currentResponseFbId)return;
+  const text=$("#responseText").value.trim();
+  if(!text){alert("Please write a response");return;}
+  fetch(`/api/feedback/${currentResponseFbId}/response`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:text})})
+    .then(r=>r.json())
+    .then(()=>{loadFeedbacks();closeResponseModal();})
+    .catch(e=>console.error(e));
+}
+
+function toggleStatus(fbId,newStatus){
+  fetch(`/api/feedback/${fbId}/status`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:newStatus})})
+    .then(r=>r.json())
+    .then(()=>{loadFeedbacks();})
+    .catch(e=>console.error(e));
+}
+
+function deleteFeedback(fbId){
+  if(!confirm("Are you sure you want to delete this feedback?"))return;
+  fetch(`/api/feedback/${fbId}/delete`,{method:"DELETE"})
+    .then(r=>r.json())
+    .then(()=>{loadFeedbacks();})
+    .catch(e=>console.error(e));
+}
+
+function toggleDeleteButtons(){
+  deleteButtonsVisible=!deleteButtonsVisible;
+  document.body.classList.toggle("show-delete",deleteButtonsVisible);
+}
+
+document.addEventListener("keydown",e=>{
+  const tag=(e.target&&e.target.tagName)?e.target.tagName.toLowerCase():"";
+  const isEditing=tag==="input"||tag==="textarea"||(e.target&&e.target.isContentEditable);
+  if((e.key==="d"||e.key==="D")&&!e.repeat&&!isEditing){
+    e.preventDefault();
+    toggleDeleteButtons();
+  }
+});
+
+function escapeHtml(text){
+  const map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'};
+  return text.replace(/[&<>"']/g,m=>map[m]);
+}
+
+// Cerrar modal al hacer click fuera
+$$(".modal-backdrop").forEach(m=>{m.addEventListener("click",e=>{if(e.target===m)m.classList.remove("show");});});
+
+// Cargar feedbacks al iniciar
+loadCreativeLinks();
+loadFeedbacks();
+setInterval(loadFeedbacks,30000);
 
 doLoad("today");
 setInterval(checkAutoReport,60000);
