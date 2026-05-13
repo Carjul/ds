@@ -24,33 +24,33 @@ PORT = int(os.environ.get("PORT", 5001))
 API_VERSION = "v21.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}/"
 
-ACCOUNTS = [
-    {"name":"GM-177","id":"act_1027335185283047","bm":"BM1"},
-    {"name":"RPG 15","id":"act_2121935234933980","bm":"BM1"},
-    {"name":"THM-60","id":"act_1247132143392586","bm":"BM1"},
-    {"name":"THM-32","id":"act_1985532452249785","bm":"BM1"},
-    {"name":"THM-54","id":"act_1594785768155717","bm":"BM1"},
-    {"name":"THM-72","id":"act_1540233950717702","bm":"BM1"},
-    {"name":"THM-113","id":"act_1074066461137769","bm":"BM1"},
-    {"name":"THM-200","id":"act_1059904599553927","bm":"BM1"},
-    {"name":"DG-03","id":"act_1306256300004871","bm":"BM2"},
-    {"name":"DG-51","id":"act_900364275348331","bm":"BM2"},
-    {"name":"MSTC-20","id":"act_1239484177480232","bm":"BM2"},
-    {"name":"THM-119","id":"act_1650693448960867","bm":"BM2"},
-    {"name":"KM-19","id":"act_2049541032515377","bm":"BM2"},
-    {"name":"THM-55","id":"act_1654285161902955","bm":"BM2"},
-]
-
 LIVE_MODE = BM1_TOKEN != "YOUR_BM1_TOKEN_HERE" or BM2_TOKEN != "YOUR_BM2_TOKEN_HERE"
 INSIGHTS_FIELDS = "spend,impressions,cpm,cpc,ctr,unique_link_clicks_ctr,actions,cost_per_action_type,purchase_roas"
 CAMPAIGN_CACHE_FILE = "campaigns_cache.json"
 campaign_cache_lock = threading.Lock()
+ACCOUNT_CACHE_TTL = 300
+account_cache_lock = threading.Lock()
+account_cache: dict[str, Any] = {"accounts": None, "generated_at": 0.0}
+EXCLUDED_ACCOUNT_IDS = {
+    normalize.strip() for normalize in os.environ.get("EXCLUDED_ACCOUNT_IDS", "act_1037309266927320").split(",") if normalize.strip()
+}
+EXCLUDED_ACCOUNT_NAMES = {
+    name.strip().lower() for name in os.environ.get("EXCLUDED_ACCOUNT_NAMES", "MARTHA 1").split(",") if name.strip()
+}
 
 def get_token(bm):
     return BM1_TOKEN if bm == "BM1" else BM2_TOKEN
 
 def has_token(bm):
     return get_token(bm) not in ("", "YOUR_BM1_TOKEN_HERE", "YOUR_BM2_TOKEN_HERE")
+
+def empty_metrics(account):
+    return {
+        "name": account["name"], "bm": account["bm"], "id": account["id"],
+        "spend": 0, "purchases": 0, "revenue": 0, "impressions": 0,
+        "cpm": 0, "cpc": 0, "ctr": 0, "unique_link_ctr": 0,
+        "checkouts": 0, "cost_checkout": 0,
+    }
 
 def fetch_graph_pages(url, params=None, timeout=30, max_pages=50):
     rows = []
@@ -68,6 +68,78 @@ def fetch_graph_pages(url, params=None, timeout=30, max_pages=50):
         next_params = None
 
     return rows
+
+def normalize_account_id(value):
+    if not value:
+        return ""
+    value = str(value)
+    return value if value.startswith("act_") else f"act_{value}"
+
+def is_excluded_account(account):
+    account_id = normalize_account_id(account.get("id") or account.get("account_id"))
+    account_name = (account.get("name") or "").strip().lower()
+    return account_id in EXCLUDED_ACCOUNT_IDS or account_name in EXCLUDED_ACCOUNT_NAMES
+
+def is_allowed_account(account):
+    account_status = int(account.get("account_status") or 0)
+    disable_reason = int(account.get("disable_reason") or 0)
+    if is_excluded_account(account):
+        return False
+    if account_status != 1:
+        return False
+    return disable_reason in (0, 1)
+
+def fetch_dynamic_accounts_for_bm(bm):
+    if not has_token(bm):
+        return []
+
+    url = f"{BASE}me/adaccounts"
+    params = {
+        "fields": "id,account_id,name,account_status,disable_reason",
+        "limit": 200,
+        "access_token": get_token(bm),
+    }
+
+    try:
+        rows = fetch_graph_pages(url, params=params, timeout=30)
+    except Exception:
+        return []
+
+    accounts = []
+    seen = set()
+    for row in rows:
+        acct_id = normalize_account_id(row.get("id") or row.get("account_id"))
+        if not acct_id or acct_id in seen or not is_allowed_account(row):
+            continue
+        seen.add(acct_id)
+        accounts.append({
+            "name": row.get("name") or acct_id,
+            "id": acct_id,
+            "bm": bm,
+            "account_status": int(row.get("account_status") or 0),
+            "disable_reason": int(row.get("disable_reason") or 0),
+        })
+    return accounts
+
+def get_accounts(force_refresh=False):
+    now = _time.time()
+    with account_cache_lock:
+        cached_accounts = account_cache.get("accounts")
+        generated_at = float(account_cache.get("generated_at") or 0)
+        if not force_refresh and cached_accounts is not None and now - generated_at < ACCOUNT_CACHE_TTL:
+            return cached_accounts
+
+    accounts = []
+    for bm in ("BM1", "BM2"):
+        accounts.extend(fetch_dynamic_accounts_for_bm(bm))
+
+    accounts.sort(key=lambda account: ((account.get("name") or "").lower(), account["id"]))
+
+    with account_cache_lock:
+        account_cache["accounts"] = accounts
+        account_cache["generated_at"] = now
+
+    return accounts
 
 def load_campaign_cache():
     with campaign_cache_lock:
@@ -162,14 +234,20 @@ def campaign_status_label(camp):
 
     return camp.get("effective_status") or camp.get("status") or ""
 
+def is_scheduled_campaign(camp):
+    return campaign_status_label(camp).upper() == "SCHEDULED"
+
 def is_visible_campaign(camp):
     status = (camp.get("status") or camp.get("configured_status") or "").upper()
     effective_status = (camp.get("effective_status") or "").upper()
     return status == "ACTIVE" or effective_status == "ACTIVE"
 
+def is_displayable_campaign(camp):
+    return is_visible_campaign(camp) or is_scheduled_campaign(camp)
+
 def fetch_account(account, date_preset):
     if not has_token(account["bm"]):
-        return {"name":account["name"],"bm":account["bm"],"id":account["id"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"unique_link_ctr":0,"checkouts":0,"cost_checkout":0}
+        return empty_metrics(account)
 
     token = get_token(account["bm"])
     url = f"{BASE}{account['id']}/insights"
@@ -178,28 +256,28 @@ def fetch_account(account, date_preset):
         r = requests.get(url, params=params, timeout=30)
         data = r.json().get("data", [])
         if not data:
-            return {"name":account["name"],"bm":account["bm"],"id":account["id"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"unique_link_ctr":0,"checkouts":0,"cost_checkout":0}
+            return empty_metrics(account)
         return parse_insights(data[0], account)
     except Exception:
-        return {"name":account["name"],"bm":account["bm"],"id":account["id"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"checkouts":0,"cost_checkout":0}
+        return empty_metrics(account)
 
 def has_active_campaigns(account):
     token = get_token(account["bm"])
     url = f"{BASE}{account['id']}/campaigns"
     params = {
-        "fields": "id,status,effective_status,configured_status,start_time",
+        "fields": "id,status,effective_status,configured_status,start_time,adsets.limit(50){id,status,effective_status,configured_status,start_time}",
         "limit": 200,
         "access_token": token,
     }
     try:
         campaigns = fetch_graph_pages(url, params=params, timeout=15)
-        return any(is_visible_campaign(c) for c in campaigns)
+        return any(is_displayable_campaign(c) for c in campaigns)
     except Exception:
         return False
 
-def fetch_all_live(date_preset):
+def fetch_all_live(date_preset, force_refresh_accounts=False):
     active_accounts = []
-    accounts_with_token = [a for a in ACCOUNTS if has_token(a["bm"])]
+    accounts_with_token = get_accounts(force_refresh=force_refresh_accounts)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(has_active_campaigns, a): a for a in accounts_with_token}
         for f in concurrent.futures.as_completed(futures):
@@ -242,7 +320,7 @@ def fetch_campaigns(account_id, bm, date_preset, use_cache=True):
         "access_token": token,
     }
     try:
-        campaigns = [c for c in fetch_graph_pages(url, params=params, timeout=30) if is_visible_campaign(c)]
+        campaigns = [c for c in fetch_graph_pages(url, params=params, timeout=30) if is_displayable_campaign(c)]
     except Exception:
         return []
 
@@ -345,9 +423,10 @@ def index():
 
 @app.route("/api/data/<period>")
 def api_data(period):
+    force_refresh_accounts = flask_request.args.get("refresh") == "1"
     if LIVE_MODE:
         preset = DATE_MAP.get(period, "today")
-        rows = fetch_all_live(preset)
+        rows = fetch_all_live(preset, force_refresh_accounts=force_refresh_accounts)
     else:
         rows = []
     if not LIVE_MODE:
@@ -356,16 +435,18 @@ def api_data(period):
 
 @app.route("/api/data/all")
 def api_data_all():
+    force_refresh_accounts = flask_request.args.get("refresh") == "1"
     data = {}
     for period, preset in DATE_MAP.items():
-        data[period] = fetch_all_live(preset) if LIVE_MODE else []
+        data[period] = fetch_all_live(preset, force_refresh_accounts=force_refresh_accounts) if LIVE_MODE else []
     return jsonify(data)
 
 @app.route("/api/bootstrap")
 def api_bootstrap():
+    force_refresh_accounts = flask_request.args.get("refresh") == "1"
     data = {}
     for period, preset in DATE_MAP.items():
-        data[period] = fetch_all_live(preset) if LIVE_MODE else []
+        data[period] = fetch_all_live(preset, force_refresh_accounts=force_refresh_accounts) if LIVE_MODE else []
     return jsonify(data)
 
 @app.route("/api/campaigns")
@@ -373,9 +454,10 @@ def api_campaigns():
     account_id = flask_request.args.get("account_id") or ""
     bm = flask_request.args.get("bm")
     period = flask_request.args.get("period", "today")
+    force_refresh = flask_request.args.get("refresh") == "1"
     preset = DATE_MAP.get(period, "today")
     if LIVE_MODE:
-        camps = fetch_campaigns(account_id, bm, preset)
+        camps = fetch_campaigns(account_id, bm, preset, use_cache=not force_refresh)
     else:
         camps = []
     return jsonify(camps)
@@ -931,7 +1013,7 @@ function toggleCamps(acctId, bm){
   expandedAcct=acctId;
   renderTable();
   if(!campCache[acctId]){
-    fetch(`/api/campaigns?account_id=${acctId}&bm=${bm}&period=${currentPeriod}`)
+    fetch(`/api/campaigns?account_id=${acctId}&bm=${bm}&period=${currentPeriod}&refresh=1`)
       .then(r=>r.json())
       .then(data=>{campCache[acctId]=data;renderTable();})
       .catch(()=>{campCache[acctId]=[];renderTable();});
@@ -1031,7 +1113,7 @@ function doLoad(period,force=false){
   $("#loader").classList.add("show");
   $("#tableWrap").style.opacity="0.3";
 
-  fetch("/api/bootstrap")
+  fetch(`/api/bootstrap${force?"?refresh=1":""}`)
     .then(r=>r.json())
     .then(data=>{
       periodRowsCache={
