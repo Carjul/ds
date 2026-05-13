@@ -9,7 +9,7 @@ Usage:
 """
 
 import json, os, requests, concurrent.futures, threading, time as _time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 from flask import Flask, render_template_string, jsonify, request as flask_request
@@ -17,16 +17,14 @@ from flask import Flask, render_template_string, jsonify, request as flask_reque
 # ============================================================
 # CONFIG
 # ============================================================
-BM1_TOKEN = os.environ.get("BM1_TOKEN", "YOUR_BM1_TOKEN_HERE")
-BM2_TOKEN = os.environ.get("BM2_TOKEN", "YOUR_BM2_TOKEN_HERE")
+BM1_TOKEN = os.environ.get("BM1_TOKEN", "EAAVMxsyNFZAQBRJqvle828ZB7xEmiPlyJPY2EtdFHFe0HjfdZCLY7oj2dUYSr2LrUNECFYbZBTYRmrs3BDPW4W91gUgkclmZCpOMcLE87iLlb5ZAABkgHDFkO4hW9VDlvO9uMrWv1IwfKM7uM0tZBWANrj4imlDdRmL26kVVgD3Gr5bt7zq21hH3u1Fyzlixd2ANgZDZD")
+BM2_TOKEN = os.environ.get("BM2_TOKEN", "EAAM9k7lNdS0BRJ6W9idRcMZCTBbqsolXpjuvMPyIqt7aqBpxbmn3K1CZC76KpdrDH3KGDAreZBuUxa1T4ZCWvT3yTiChtzhdiKfvNgEo1xZB0KsKHlTdS9FqUe3Gko7bZAzX5ediAxZBVSc8ADnV9ZBgNwifZAJUcsEVuqYhBIYKB8p2rQqvcMDtALe2leFRI6aTqcAZDZD")
 PORT = int(os.environ.get("PORT", 5001))
 
 API_VERSION = "v21.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}/"
 
 ACCOUNTS = [
-    {"name":"MARTHA 2","id":"act_528756616577904","bm":"BM1"},
-    {"name":"MARTHA 4","id":"act_708152401990591","bm":"BM1"},
     {"name":"GM-177","id":"act_1027335185283047","bm":"BM1"},
     {"name":"RPG 15","id":"act_2121935234933980","bm":"BM1"},
     {"name":"THM-60","id":"act_1247132143392586","bm":"BM1"},
@@ -43,44 +41,62 @@ ACCOUNTS = [
     {"name":"THM-55","id":"act_1654285161902955","bm":"BM2"},
 ]
 
-LIVE_MODE = BM1_TOKEN != "YOUR_BM1_TOKEN_HERE"
+LIVE_MODE = BM1_TOKEN != "YOUR_BM1_TOKEN_HERE" or BM2_TOKEN != "YOUR_BM2_TOKEN_HERE"
 INSIGHTS_FIELDS = "spend,impressions,cpm,cpc,ctr,unique_link_clicks_ctr,actions,cost_per_action_type,purchase_roas"
+CAMPAIGN_CACHE_FILE = "campaigns_cache.json"
+campaign_cache_lock = threading.Lock()
 
 def get_token(bm):
     return BM1_TOKEN if bm == "BM1" else BM2_TOKEN
 
-# ============================================================
-# CACHED DATA
-# ============================================================
-CACHED = {
-    "today": [
-        {"name":"THM-200","bm":"BM1","id":"act_1059904599553927","spend":337.94,"purchases":3,"revenue":253.46,"impressions":3760,"cpm":89.88,"cpc":1.10,"ctr":8.19,"unique_link_ctr":5.42,"checkouts":32,"cost_checkout":10.56},
-        {"name":"THM-32","bm":"BM1","id":"act_1985532452249785","spend":1.56,"purchases":0,"revenue":0,"impressions":21,"cpm":74.29,"cpc":0.52,"ctr":14.29,"unique_link_ctr":14.29,"checkouts":0,"cost_checkout":0},
-    ],
-    "yesterday": [
-        {"name":"THM-200","bm":"BM1","id":"act_1059904599553927","spend":402.24,"purchases":2,"revenue":169.94,"impressions":4885,"cpm":82.34,"cpc":1.03,"ctr":8.02,"unique_link_ctr":5.18,"checkouts":16,"cost_checkout":25.14},
-        {"name":"THM-32","bm":"BM1","id":"act_1985532452249785","spend":1.71,"purchases":0,"revenue":0,"impressions":24,"cpm":71.25,"cpc":0.57,"ctr":12.50,"unique_link_ctr":12.50,"checkouts":0,"cost_checkout":0},
-    ],
-    "month": [
-        {"name":"THM-200","bm":"BM1","id":"act_1059904599553927","spend":747.30,"purchases":5,"revenue":425.96,"impressions":8760,"cpm":85.31,"cpc":1.06,"ctr":8.08,"unique_link_ctr":5.28,"checkouts":48,"cost_checkout":15.57},
-        {"name":"THM-32","bm":"BM1","id":"act_1985532452249785","spend":4.73,"purchases":0,"revenue":0,"impressions":71,"cpm":66.62,"cpc":0.59,"ctr":11.27,"unique_link_ctr":11.27,"checkouts":0,"cost_checkout":0},
-    ],
-}
+def has_token(bm):
+    return get_token(bm) not in ("", "YOUR_BM1_TOKEN_HERE", "YOUR_BM2_TOKEN_HERE")
 
-CACHED_CAMPAIGNS = {
-    "act_1059904599553927": {
-        "today": [
-            {"id":"120248362905750699","name":"[Zoey Dalton]-[SCRIPT 23 - V1]-#1","spend":80.53,"purchases":1,"revenue":85.36,"impressions":1026,"cpm":78.49,"cpc":1.09,"ctr":7.21,"unique_link_ctr":4.87,"checkouts":8,"cost_checkout":10.07},
-            {"id":"120248367316380699","name":"[Zoey Dalton]-[SCRIPT 23 - V4]-#1","spend":74.29,"purchases":1,"revenue":84.69,"impressions":725,"cpm":102.47,"cpc":1.20,"ctr":8.55,"unique_link_ctr":5.66,"checkouts":5,"cost_checkout":14.86},
-            {"id":"120248367336190699","name":"[Zoey Dalton]-[SCRIPT 23 - V5]-#1","spend":79.52,"purchases":0,"revenue":0,"impressions":907,"cpm":87.67,"cpc":1.12,"ctr":7.83,"unique_link_ctr":5.18,"checkouts":7,"cost_checkout":11.36},
-        ],
-    },
-    "act_1985532452249785": {
-        "today": [
-            {"id":"120249848881790273","name":"TEST 1$","spend":1.56,"purchases":0,"revenue":0,"impressions":21,"cpm":74.29,"cpc":0.52,"ctr":14.29,"unique_link_ctr":14.29,"checkouts":0,"cost_checkout":0},
-        ],
-    },
-}
+def fetch_graph_pages(url, params=None, timeout=30, max_pages=50):
+    rows = []
+    next_url = url
+    next_params = params
+
+    for _ in range(max_pages):
+        r = requests.get(next_url, params=next_params, timeout=timeout)
+        payload = r.json()
+        rows.extend(payload.get("data", []))
+
+        next_url = payload.get("paging", {}).get("next")
+        if not next_url:
+            break
+        next_params = None
+
+    return rows
+
+def load_campaign_cache():
+    with campaign_cache_lock:
+        try:
+            if os.path.exists(CAMPAIGN_CACHE_FILE):
+                with open(CAMPAIGN_CACHE_FILE, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_campaign_cache(data):
+    with campaign_cache_lock:
+        try:
+            with open(CAMPAIGN_CACHE_FILE, "w") as f:
+                json.dump(data, f)
+            return True
+        except Exception:
+            return False
+
+def get_cached_campaigns(account_id, date_preset):
+    cache = load_campaign_cache()
+    return cache.get(date_preset, {}).get(account_id)
+
+def set_cached_campaigns(account_id, date_preset, campaigns):
+    cache = load_campaign_cache()
+    period_cache = cache.setdefault(date_preset, {})
+    period_cache[account_id] = campaigns
+    save_campaign_cache(cache)
 
 # ============================================================
 # META API
@@ -119,7 +135,42 @@ def parse_insights(row, account):
         "checkouts": checkouts, "cost_checkout": round(cost_checkout, 2),
     }
 
+def parse_meta_datetime(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+def is_future_time(value):
+    dt = parse_meta_datetime(value)
+    return bool(dt and dt > datetime.now(dt.tzinfo))
+
+def campaign_status_label(camp):
+    if is_future_time(camp.get("start_time")):
+        return "SCHEDULED"
+
+    adsets = camp.get("adsets", {}).get("data", []) if isinstance(camp.get("adsets"), dict) else []
+    for adset in adsets:
+        adset_status = (adset.get("status") or adset.get("configured_status") or "").upper()
+        if adset_status == "ACTIVE" and is_future_time(adset.get("start_time")):
+            return "SCHEDULED"
+
+    return camp.get("effective_status") or camp.get("status") or ""
+
+def is_visible_campaign(camp):
+    status = (camp.get("status") or camp.get("configured_status") or "").upper()
+    effective_status = (camp.get("effective_status") or "").upper()
+    return status == "ACTIVE" or effective_status == "ACTIVE"
+
 def fetch_account(account, date_preset):
+    if not has_token(account["bm"]):
+        return {"name":account["name"],"bm":account["bm"],"id":account["id"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"unique_link_ctr":0,"checkouts":0,"cost_checkout":0}
+
     token = get_token(account["bm"])
     url = f"{BASE}{account['id']}/insights"
     params = {"fields": INSIGHTS_FIELDS, "date_preset": date_preset, "access_token": token}
@@ -136,21 +187,21 @@ def has_active_campaigns(account):
     token = get_token(account["bm"])
     url = f"{BASE}{account['id']}/campaigns"
     params = {
-        "fields": "id",
-        "filtering": json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
-        "limit": 1,
+        "fields": "id,status,effective_status,configured_status,start_time",
+        "limit": 200,
         "access_token": token,
     }
     try:
-        r = requests.get(url, params=params, timeout=15)
-        return len(r.json().get("data", [])) > 0
+        campaigns = fetch_graph_pages(url, params=params, timeout=15)
+        return any(is_visible_campaign(c) for c in campaigns)
     except Exception:
         return False
 
 def fetch_all_live(date_preset):
     active_accounts = []
+    accounts_with_token = [a for a in ACCOUNTS if has_token(a["bm"])]
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(has_active_campaigns, a): a for a in ACCOUNTS}
+        futures = {ex.submit(has_active_campaigns, a): a for a in accounts_with_token}
         for f in concurrent.futures.as_completed(futures):
             acct = futures[f]
             if f.result():
@@ -161,21 +212,37 @@ def fetch_all_live(date_preset):
         futures = {ex.submit(fetch_account, a, date_preset): a for a in active_accounts}
         for f in concurrent.futures.as_completed(futures):
             results.append(f.result())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(fetch_campaigns, a["id"], a["bm"], date_preset, False): a for a in active_accounts}
+        for f in concurrent.futures.as_completed(futures):
+            acct = futures[f]
+            try:
+                set_cached_campaigns(acct["id"], date_preset, f.result())
+            except Exception:
+                set_cached_campaigns(acct["id"], date_preset, [])
+
     results.sort(key=lambda x: x["spend"], reverse=True)
     return results
 
-def fetch_campaigns(account_id, bm, date_preset):
+def fetch_campaigns(account_id, bm, date_preset, use_cache=True):
+    if use_cache:
+        cached = get_cached_campaigns(account_id, date_preset)
+        if cached is not None:
+            return cached
+
+    if not has_token(bm):
+        return []
+
     token = get_token(bm)
     url = f"{BASE}{account_id}/campaigns"
     params = {
-        "fields": "id,name,status,effective_status",
-        "filtering": json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
+        "fields": "id,name,status,effective_status,configured_status,start_time,adsets.limit(50){id,status,effective_status,configured_status,start_time}",
         "limit": 200,
         "access_token": token,
     }
     try:
-        r = requests.get(url, params=params, timeout=30)
-        campaigns = r.json().get("data", [])
+        campaigns = [c for c in fetch_graph_pages(url, params=params, timeout=30) if is_visible_campaign(c)]
     except Exception:
         return []
 
@@ -185,15 +252,17 @@ def fetch_campaigns(account_id, bm, date_preset):
         try:
             r2 = requests.get(url2, params=p2, timeout=30)
             data = r2.json().get("data", [])
+            status_label = campaign_status_label(camp)
             if not data:
-                return {"id":camp["id"],"name":camp["name"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"unique_link_ctr":0,"checkouts":0,"cost_checkout":0}
+                return {"id":camp["id"],"name":camp["name"],"status":status_label,"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"unique_link_ctr":0,"checkouts":0,"cost_checkout":0}
             row = data[0]
             acct = {"name":camp["name"],"bm":bm,"id":camp["id"]}
             result = parse_insights(row, acct)
             result["id"] = camp["id"]
+            result["status"] = status_label
             return result
         except Exception:
-            return {"id":camp["id"],"name":camp["name"],"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"checkouts":0,"cost_checkout":0}
+            return {"id":camp["id"],"name":camp["name"],"status":campaign_status_label(camp),"spend":0,"purchases":0,"revenue":0,"impressions":0,"cpm":0,"cpc":0,"ctr":0,"checkouts":0,"cost_checkout":0}
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
@@ -201,6 +270,7 @@ def fetch_campaigns(account_id, bm, date_preset):
         for f in concurrent.futures.as_completed(futures):
             results.append(f.result())
     results.sort(key=lambda x: x["spend"], reverse=True)
+    set_cached_campaigns(account_id, date_preset, results)
     return results
 
 # ============================================================
@@ -212,7 +282,7 @@ def generate_report():
     if LIVE_MODE:
         data = fetch_all_live("today")
     else:
-        data = CACHED.get("today", [])
+        data = []
     report_cache["data"] = data
     report_cache["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"  [AUTO-REPORT] Generated at {report_cache['generated_at']}")
@@ -279,9 +349,24 @@ def api_data(period):
         preset = DATE_MAP.get(period, "today")
         rows = fetch_all_live(preset)
     else:
-        rows = CACHED.get(period, CACHED["today"])
-    rows = [r for r in rows if r.get("spend", 0) > 0]
+        rows = []
+    if not LIVE_MODE:
+        rows = [r for r in rows if r.get("spend", 0) > 0]
     return jsonify(rows)
+
+@app.route("/api/data/all")
+def api_data_all():
+    data = {}
+    for period, preset in DATE_MAP.items():
+        data[period] = fetch_all_live(preset) if LIVE_MODE else []
+    return jsonify(data)
+
+@app.route("/api/bootstrap")
+def api_bootstrap():
+    data = {}
+    for period, preset in DATE_MAP.items():
+        data[period] = fetch_all_live(preset) if LIVE_MODE else []
+    return jsonify(data)
 
 @app.route("/api/campaigns")
 def api_campaigns():
@@ -292,8 +377,7 @@ def api_campaigns():
     if LIVE_MODE:
         camps = fetch_campaigns(account_id, bm, preset)
     else:
-        acct_camps = CACHED_CAMPAIGNS.get(account_id, {})
-        camps = acct_camps.get(period, acct_camps.get("today", []))
+        camps = []
     return jsonify(camps)
 
 @app.route("/api/report")
@@ -468,7 +552,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;ba
 .th-bar .cnt{font-size:12px;color:var(--text3);background:var(--bg);padding:2px 10px;border-radius:10px}
 
 .tbl-scroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:1200px}
+table{width:100%;border-collapse:collapse;min-width:1280px}
 thead th{text-align:left;padding:10px 12px;font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
 thead th.num{text-align:right}
 thead th:hover{color:var(--text)}
@@ -495,6 +579,8 @@ tr.camp-row td:first-child{padding-left:44px}
 .camp-name.clickable{cursor:pointer}
 .camp-name.clickable:hover{text-decoration:underline}
 .camp-loader{text-align:center;padding:12px;color:var(--text3);font-size:12px}
+.status-badge{display:inline-block;padding:2px 7px;border-radius:999px;background:rgba(34,197,94,.14);color:var(--green);font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+.status-badge.scheduled{background:rgba(234,179,8,.14);color:var(--yellow)}
 
 .creative-link{display:inline-block;max-width:240px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;color:var(--accent);text-decoration:none}
 .creative-link:hover{text-decoration:underline}
@@ -628,6 +714,7 @@ body.show-delete .delete-btn{display:flex}
           <th class="num" data-col="unique_link_ctr">U-CTR <span class="arrow"></span></th>
           <th class="num" data-col="checkouts">IC <span class="arrow"></span></th>
           <th class="num" data-col="cost_checkout">$/IC <span class="arrow"></span></th>
+          <th>Status</th>
           <th>Creative</th>
         </tr>
       </thead>
@@ -689,13 +776,14 @@ const fmt = n => "$"+n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFr
 const fmtK = n => n>=1000000?(n/1000000).toFixed(1)+"M":n>=1000?(n/1000).toFixed(1)+"K":n.toLocaleString();
 
 let rows=[], sortCol="spend", sortAsc=false, currentPeriod="today", expandedAcct=null, campCache={};
+let periodRowsCache={}, periodCampCache={}, periodsLoaded=false;
 let creativeLinksByName={}, currentCreativeCampaignName=null;
 
 $$(".date-b").forEach(b=>b.addEventListener("click",()=>{
   $$(".date-b").forEach(x=>x.classList.remove("active"));
   b.classList.add("active");
   expandedAcct=null; campCache={};
-  doLoad(b.dataset.period);
+  showPeriod(b.dataset.period);
 }));
 
 $$('thead th[data-col]').forEach(th=>th.addEventListener("click",()=>{
@@ -760,17 +848,20 @@ function renderTable(){
       <td class="num ${r.checkouts===0?'zero':''}">${r.checkouts}</td>
       <td class="num ${r.cost_checkout>0?'':'zero'}">${r.cost_checkout>0?fmt(r.cost_checkout):'—'}</td>
       <td class="zero">-</td>
+      <td class="zero">-</td>
     </tr>`;
     if(isOpen){
       const camps=campCache[r.id];
       if(!camps){
-        html+=`<tr class="camp-row"><td colspan="14" class="camp-loader"><div class="spin" style="width:16px;height:16px;border-width:2px"></div> Loading campaigns...</td></tr>`;
+        html+=`<tr class="camp-row"><td colspan="15" class="camp-loader"><div class="spin" style="width:16px;height:16px;border-width:2px"></div> Loading campaigns...</td></tr>`;
       } else if(camps.length===0){
-        html+=`<tr class="camp-row"><td colspan="14" class="camp-loader">No active campaigns</td></tr>`;
+        html+=`<tr class="camp-row"><td colspan="15" class="camp-loader">No active or scheduled campaigns</td></tr>`;
       } else {
         camps.forEach(c=>{
           const encodedCampName=encodeURIComponent(c.name||"");
           const creativeUrl=creativeLinksByName[c.name]||"";
+          const campStatus=(c.status||"").toString();
+          const statusClass=campStatus.toUpperCase()==="SCHEDULED"?" scheduled":"";
           const creativeCell=creativeUrl
             ? `<a class="creative-link" href="${escapeHtml(creativeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(creativeUrl)}</a><button class="creative-action creative-edit-btn" data-camp-name="${encodedCampName}">Edit</button>`
             : `<button class="creative-action creative-add-btn" data-camp-name="${encodedCampName}">Add</button>`;
@@ -791,6 +882,7 @@ function renderTable(){
             <td class="num">${(c.unique_link_ctr||0).toFixed(2)}%</td>
             <td class="num ${(c.checkouts||0)===0?'zero':''}">${c.checkouts||0}</td>
             <td class="num ${(c.cost_checkout||0)>0?'':'zero'}">${(c.cost_checkout||0)>0?fmt(c.cost_checkout):'—'}</td>
+            <td>${campStatus?`<span class="status-badge${statusClass}">${escapeHtml(campStatus)}</span>`:'-'}</td>
             <td>${creativeCell}</td>
           </tr>`;
         });
@@ -830,6 +922,7 @@ function renderTable(){
     <td class="num">${tc.toLocaleString()}</td>
     <td class="num">${tCostCO>0?fmt(tCostCO):'—'}</td>
     <td class="zero">-</td>
+    <td class="zero">-</td>
   </tr>`;
 }
 
@@ -843,6 +936,15 @@ function toggleCamps(acctId, bm){
       .then(data=>{campCache[acctId]=data;renderTable();})
       .catch(()=>{campCache[acctId]=[];renderTable();});
   }
+}
+
+function showPeriod(period){
+  currentPeriod=period;
+  rows=periodRowsCache[period]||[];
+  campCache=periodCampCache[period]||{};
+  periodCampCache[period]=campCache;
+  renderCards();
+  renderTable();
 }
 
 function loadCreativeLinks(){
@@ -898,7 +1000,7 @@ function submitCreativeLink(){
 }
 
 // ---- Refresh ----
-function refresh(){doLoad(currentPeriod);}
+function refresh(){doLoad(currentPeriod,true);}
 
 function updateTimestamp(){
   const t=new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"});
@@ -912,7 +1014,16 @@ function checkAutoReport(){
   }).catch(()=>{});
 }
 
-function doLoad(period){
+function normalizeRows(data){
+  return (data||[]).map(r=>({...r,
+    profit:r.revenue-r.spend,
+    cpa:r.purchases>0?r.spend/r.purchases:null,
+    roi:r.spend>0?((r.revenue-r.spend)/r.spend)*100:null,
+  }));
+}
+
+function doLoad(period,force=false){
+  if(periodsLoaded&&!force){showPeriod(period);return;}
   currentPeriod=period;
   $("#refreshBtn").classList.add("spinning");
   $$(".date-b").forEach(b=>b.disabled=true);
@@ -920,15 +1031,18 @@ function doLoad(period){
   $("#loader").classList.add("show");
   $("#tableWrap").style.opacity="0.3";
 
-  fetch("/api/data/"+period)
+  fetch("/api/bootstrap")
     .then(r=>r.json())
     .then(data=>{
-      rows=data.map(r=>({...r,
-        profit:r.revenue-r.spend,
-        cpa:r.purchases>0?r.spend/r.purchases:null,
-        roi:r.spend>0?((r.revenue-r.spend)/r.spend)*100:null,
-      }));
-      renderCards();renderTable();finish();
+      periodRowsCache={
+        today:normalizeRows(data.today),
+        yesterday:normalizeRows(data.yesterday),
+        month:normalizeRows(data.month),
+      };
+      periodCampCache={today:{},yesterday:{},month:{}};
+      periodsLoaded=true;
+      showPeriod(period);
+      finish();
     })
     .catch(()=>finish());
 }

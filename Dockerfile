@@ -2,14 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir flask requests
+RUN pip install --no-cache-dir flask requests waitress
 
 COPY fb_dashboard_pro.py .
 
-ENV PORT=5000
+ENV PORT=5001
 ENV BM1_TOKEN=EAAVMxsyNFZAQBRJqvle828ZB7xEmiPlyJPY2EtdFHFe0HjfdZCLY7oj2dUYSr2LrUNECFYbZBTYRmrs3BDPW4W91gUgkclmZCpOMcLE87iLlb5ZAABkgHDFkO4hW9VDlvO9uMrWv1IwfKM7uM0tZBWANrj4imlDdRmL26kVVgD3Gr5bt7zq21hH3u1Fyzlixd2ANgZDZD
 ENV BM2_TOKEN=EAAM9k7lNdS0BRJ6W9idRcMZCTBbqsolXpjuvMPyIqt7aqBpxbmn3K1CZC76KpdrDH3KGDAreZBuUxa1T4ZCWvT3yTiChtzhdiKfvNgEo1xZB0KsKHlTdS9FqUe3Gko7bZAzX5ediAxZBVSc8ADnV9ZBgNwifZAJUcsEVuqYhBIYKB8p2rQqvcMDtALe2leFRI6aTqcAZDZD
 
+
 EXPOSE ${PORT}
 
-CMD ["python", "fb_dashboard_pro.py"]
+CMD ["sh", "-c", "waitress-serve --host=0.0.0.0 --port=${PORT} fb_dashboard_pro:app"]
