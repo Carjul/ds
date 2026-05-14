@@ -32,7 +32,7 @@ ACCOUNT_CACHE_TTL = 300
 account_cache_lock = threading.Lock()
 account_cache: dict[str, Any] = {"accounts": None, "generated_at": 0.0}
 EXCLUDED_ACCOUNT_IDS = {
-    normalize.strip() for normalize in os.environ.get("EXCLUDED_ACCOUNT_IDS", "act_1037309266927320").split(",") if normalize.strip()
+    normalize.strip() for normalize in os.environ.get("EXCLUDED_ACCOUNT_IDS", "act_1037309266927320, act_1239484177480232").split(",") if normalize.strip()
 }
 EXCLUDED_ACCOUNT_NAMES = {
     name.strip().lower() for name in os.environ.get("EXCLUDED_ACCOUNT_NAMES", "MARTHA 1").split(",") if name.strip()
