@@ -17,14 +17,23 @@ from flask import Flask, render_template_string, jsonify, request as flask_reque
 # ============================================================
 # CONFIG
 # ============================================================
-BM1_TOKEN = os.environ.get("BM1_TOKEN", "EAAVMxsyNFZAQBRJqvle828ZB7xEmiPlyJPY2EtdFHFe0HjfdZCLY7oj2dUYSr2LrUNECFYbZBTYRmrs3BDPW4W91gUgkclmZCpOMcLE87iLlb5ZAABkgHDFkO4hW9VDlvO9uMrWv1IwfKM7uM0tZBWANrj4imlDdRmL26kVVgD3Gr5bt7zq21hH3u1Fyzlixd2ANgZDZD")
-BM2_TOKEN = os.environ.get("BM2_TOKEN", "EAAM9k7lNdS0BRJ6W9idRcMZCTBbqsolXpjuvMPyIqt7aqBpxbmn3K1CZC76KpdrDH3KGDAreZBuUxa1T4ZCWvT3yTiChtzhdiKfvNgEo1xZB0KsKHlTdS9FqUe3Gko7bZAzX5ediAxZBVSc8ADnV9ZBgNwifZAJUcsEVuqYhBIYKB8p2rQqvcMDtALe2leFRI6aTqcAZDZD")
+# ⚠️ SECURITY: Tokens stored in memory only during runtime
+# Use environment variables set before app start
+_BM1_TOKEN = os.environ.get("BM1_TOKEN", "").strip()
+_BM2_TOKEN = os.environ.get("BM2_TOKEN", "").strip()
 PORT = int(os.environ.get("PORT", 5001))
 
 API_VERSION = "v21.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}/"
 
-LIVE_MODE = BM1_TOKEN != "YOUR_BM1_TOKEN_HERE" or BM2_TOKEN != "YOUR_BM2_TOKEN_HERE"
+# Validate tokens are properly set (not placeholder values)
+_VALID_BM1 = _BM1_TOKEN and _BM1_TOKEN not in ("", "YOUR_BM1_TOKEN_HERE", "PLACEHOLDER")
+_VALID_BM2 = _BM2_TOKEN and _BM2_TOKEN not in ("", "YOUR_BM2_TOKEN_HERE", "PLACEHOLDER")
+LIVE_MODE = _VALID_BM1 or _VALID_BM2
+
+# Clear tokens from direct access - use get_token() only
+os.environ.pop("BM1_TOKEN", None)
+os.environ.pop("BM2_TOKEN", None)
 INSIGHTS_FIELDS = "spend,impressions,cpm,cpc,ctr,unique_link_clicks_ctr,actions,cost_per_action_type,purchase_roas"
 CAMPAIGN_CACHE_FILE = "campaigns_cache.json"
 campaign_cache_lock = threading.Lock()
@@ -39,10 +48,16 @@ EXCLUDED_ACCOUNT_NAMES = {
 }
 
 def get_token(bm):
-    return BM1_TOKEN if bm == "BM1" else BM2_TOKEN
+    """Get access token for Business Manager. Returns empty string if not valid."""
+    if bm == "BM1":
+        return _BM1_TOKEN if _VALID_BM1 else ""
+    elif bm == "BM2":
+        return _BM2_TOKEN if _VALID_BM2 else ""
+    return ""
 
 def has_token(bm):
-    return get_token(bm) not in ("", "YOUR_BM1_TOKEN_HERE", "YOUR_BM2_TOKEN_HERE")
+    """Check if Business Manager has a valid token."""
+    return bool(get_token(bm))
 
 def empty_metrics(account):
     return {
@@ -52,20 +67,37 @@ def empty_metrics(account):
         "checkouts": 0, "cost_checkout": 0,
     }
 
-def fetch_graph_pages(url, params=None, timeout=30, max_pages=50):
+def fetch_graph_pages(url, params=None, timeout=30, max_pages=50, access_token=None):
+    """
+    Fetch paginated data from Graph API.
+    ⚠️ SECURITY: access_token passed separately, not in params.
+    """
     rows = []
     next_url = url
-    next_params = params
+    next_params = params if params else {}
+    
+    # Add token to headers instead of URL params
+    headers = {}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
 
     for _ in range(max_pages):
-        r = requests.get(next_url, params=next_params, timeout=timeout)
-        payload = r.json()
-        rows.extend(payload.get("data", []))
+        # Remove access_token from params if present (use header instead)
+        if "access_token" in next_params:
+            del next_params["access_token"]
+        
+        try:
+            r = requests.get(next_url, params=next_params, headers=headers, timeout=timeout)
+            payload = r.json()
+            rows.extend(payload.get("data", []))
 
-        next_url = payload.get("paging", {}).get("next")
-        if not next_url:
-            break
-        next_params = None
+            next_url = payload.get("paging", {}).get("next")
+            if not next_url:
+                break
+            next_params = None
+        except Exception as e:
+            # Don't log full response that might contain tokens
+            raise
 
     return rows
 
@@ -94,14 +126,14 @@ def fetch_dynamic_accounts_for_bm(bm):
         return []
 
     url = f"{BASE}me/adaccounts"
+    token = get_token(bm)
     params = {
         "fields": "id,account_id,name,account_status,disable_reason",
         "limit": 200,
-        "access_token": get_token(bm),
     }
 
     try:
-        rows = fetch_graph_pages(url, params=params, timeout=30)
+        rows = fetch_graph_pages(url, params=params, timeout=30, access_token=token)
     except Exception:
         return []
 
@@ -251,9 +283,11 @@ def fetch_account(account, date_preset):
 
     token = get_token(account["bm"])
     url = f"{BASE}{account['id']}/insights"
-    params = {"fields": INSIGHTS_FIELDS, "date_preset": date_preset, "access_token": token}
+    params = {"fields": INSIGHTS_FIELDS, "date_preset": date_preset}
+    headers = {"Authorization": f"Bearer {token}"}
+    
     try:
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.get(url, params=params, headers=headers, timeout=30)
         data = r.json().get("data", [])
         if not data:
             return empty_metrics(account)
@@ -263,14 +297,18 @@ def fetch_account(account, date_preset):
 
 def has_active_campaigns(account):
     token = get_token(account["bm"])
+    if not token:
+        return False
+    
     url = f"{BASE}{account['id']}/campaigns"
     params = {
         "fields": "id,status,effective_status,configured_status,start_time,adsets.limit(50){id,status,effective_status,configured_status,start_time}",
         "limit": 200,
-        "access_token": token,
     }
+    headers = {"Authorization": f"Bearer {token}"}
+    
     try:
-        campaigns = fetch_graph_pages(url, params=params, timeout=15)
+        campaigns = fetch_graph_pages(url, params=params, timeout=15, access_token=token)
         return any(is_displayable_campaign(c) for c in campaigns)
     except Exception:
         return False
@@ -317,18 +355,19 @@ def fetch_campaigns(account_id, bm, date_preset, use_cache=True):
     params = {
         "fields": "id,name,status,effective_status,configured_status,start_time,adsets.limit(50){id,status,effective_status,configured_status,start_time}",
         "limit": 200,
-        "access_token": token,
     }
     try:
-        campaigns = [c for c in fetch_graph_pages(url, params=params, timeout=30) if is_displayable_campaign(c)]
+        campaigns = [c for c in fetch_graph_pages(url, params=params, timeout=30, access_token=token) if is_displayable_campaign(c)]
     except Exception:
         return []
 
     def get_camp_insights(camp):
         url2 = f"{BASE}{camp['id']}/insights"
-        p2 = {"fields": INSIGHTS_FIELDS, "date_preset": date_preset, "access_token": token}
+        p2 = {"fields": INSIGHTS_FIELDS, "date_preset": date_preset}
+        headers = {"Authorization": f"Bearer {token}"}
+        
         try:
-            r2 = requests.get(url2, params=p2, timeout=30)
+            r2 = requests.get(url2, params=p2, headers=headers, timeout=30)
             data = r2.json().get("data", [])
             status_label = campaign_status_label(camp)
             if not data:
