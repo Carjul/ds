@@ -8,11 +8,11 @@ Usage:
   python fb_dashboard_pro.py
 """
 
-import json, os, requests, concurrent.futures, threading, time as _time
+import json, os, hmac, secrets, requests, concurrent.futures, threading, time as _time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
-from flask import Flask, render_template_string, jsonify, request as flask_request
+from flask import Flask, render_template_string, jsonify, request as flask_request, session, redirect, url_for
 
 # ============================================================
 # CONFIG
@@ -22,6 +22,9 @@ from flask import Flask, render_template_string, jsonify, request as flask_reque
 _BM1_TOKEN = os.environ.get("BM1_TOKEN", "").strip()
 _BM2_TOKEN = os.environ.get("BM2_TOKEN", "").strip()
 PORT = int(os.environ.get("PORT", 5001))
+AUTH_USER = os.environ.get("DASHBOARD_USER", "").strip()
+AUTH_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "").strip()
+SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "").strip() or secrets.token_hex(32)
 
 API_VERSION = "v21.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}/"
@@ -454,7 +457,98 @@ def get_response_id():
 # FLASK
 # ============================================================
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
 DATE_MAP = {"today":"today","yesterday":"yesterday","month":"this_month"}
+
+def auth_enabled():
+    return bool(AUTH_USER and AUTH_PASSWORD)
+
+def is_authenticated():
+    return session.get("authenticated") is True
+
+@app.before_request
+def require_login():
+    if not auth_enabled():
+        return None
+
+    path = flask_request.path or "/"
+    if path.startswith("/login"):
+        return None
+
+    if is_authenticated():
+        return None
+
+    if path.startswith("/api/"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return redirect(url_for("login", next=path))
+
+LOGIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px}
+    .card{width:100%;max-width:360px;background:#111827;border:1px solid #1f2937;border-radius:12px;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    h1{margin:0 0 14px;font-size:20px}
+    .muted{color:#94a3b8;font-size:13px;margin-bottom:16px}
+    label{display:block;font-size:12px;margin-bottom:6px;color:#cbd5e1}
+    input{width:100%;padding:10px 12px;border:1px solid #334155;border-radius:8px;background:#0b1220;color:#f8fafc;margin-bottom:12px}
+    input:focus{outline:none;border-color:#3b82f6}
+    button{width:100%;padding:10px 12px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer}
+    button:hover{background:#1d4ed8}
+    .error{background:#7f1d1d;color:#fecaca;border:1px solid #b91c1c;padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:12px}
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/login?next={{ next_url }}">
+    <h1>Dashboard Login</h1>
+    <div class="muted">Enter your credentials to continue</div>
+    {error_block}
+    <label for="username">Usuario</label>
+    <input id="username" name="username" type="text" autocomplete="username" required>
+    <label for="password">Contraseña</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Iniciar sesion</button>
+  </form>
+</body>
+</html>
+"""
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not auth_enabled():
+        return redirect(url_for("index"))
+
+    error_block = ""
+    next_url = flask_request.args.get("next") or "/"
+    if not next_url.startswith("/"):
+        next_url = "/"
+
+    if flask_request.method == "POST":
+        username = (flask_request.form.get("username") or "").strip()
+        password = flask_request.form.get("password") or ""
+
+        valid_user = hmac.compare_digest(username, AUTH_USER)
+        valid_pass = hmac.compare_digest(password, AUTH_PASSWORD)
+
+        if valid_user and valid_pass:
+            session["authenticated"] = True
+            return redirect(next_url)
+
+        error_block = "<div class=\"error\">Credenciales invalidas</div>"
+
+    html = LOGIN_HTML.replace("{error_block}", error_block)
+    return render_template_string(html, next_url=next_url)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 @app.route("/")
 def index():
