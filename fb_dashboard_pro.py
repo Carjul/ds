@@ -762,6 +762,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;ba
 .icon-btn svg{width:16px;height:16px}
 .icon-btn.spinning svg{animation:sp .7s linear infinite}
 
+.logout-btn{display:inline-flex;align-items:center;gap:6px;background:var(--green);color:#052e16;border:none;padding:7px 12px;border-radius:8px;font-size:12px;font-weight:700;text-decoration:none;cursor:pointer;transition:filter .2s,transform .2s}
+.logout-btn svg{width:14px;height:14px}
+.logout-btn:hover{filter:brightness(.95);transform:translateY(-1px)}
+.logout-btn:active{transform:translateY(0)}
+
 .theme-t{width:44px;height:24px;background:var(--border);border-radius:12px;cursor:pointer;position:relative;border:none;transition:background .3s}
 .theme-t::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;background:var(--accent);border-radius:50%;transition:transform .3s}
 .light .theme-t::after{transform:translateX(20px);background:var(--yellow)}
@@ -914,6 +919,14 @@ body.show-delete .delete-btn{display:flex}
       <button class="date-b" data-period="month">Month</button>
     </div>
     <button class="theme-t" onclick="document.body.classList.toggle('light')" title="Toggle dark/light"></button>
+    <a class="logout-btn" href="/logout" title="Cerrar sesión">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M16 17l5-5-5-5"/>
+        <path d="M21 12H9"/>
+        <path d="M13 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      Salir
+    </a>
   </div>
 </div>
 
