@@ -34,6 +34,27 @@ _VALID_BM1 = _BM1_TOKEN and _BM1_TOKEN not in ("", "YOUR_BM1_TOKEN_HERE", "PLACE
 _VALID_BM2 = _BM2_TOKEN and _BM2_TOKEN not in ("", "YOUR_BM2_TOKEN_HERE", "PLACEHOLDER")
 LIVE_MODE = _VALID_BM1 or _VALID_BM2
 
+def _validate_env():
+    missing = []
+    if not AUTH_USER:
+        missing.append("DASHBOARD_USER")
+    if not AUTH_PASSWORD:
+        missing.append("DASHBOARD_PASSWORD")
+    if missing:
+        raise RuntimeError(
+            "Missing required login credentials: " + ", ".join(missing) +
+            ". Set these environment variables before starting the app."
+        )
+
+    if not _VALID_BM1 and not _VALID_BM2:
+        print("[fb_dashboard_pro] Warning: No valid BM tokens detected. LIVE_MODE is disabled.")
+    if _BM1_TOKEN and not _VALID_BM1:
+        print("[fb_dashboard_pro] Warning: BM1_TOKEN is set but invalid or placeholder.")
+    if _BM2_TOKEN and not _VALID_BM2:
+        print("[fb_dashboard_pro] Warning: BM2_TOKEN is set but invalid or placeholder.")
+
+_validate_env()
+
 # Clear tokens from direct access - use get_token() only
 os.environ.pop("BM1_TOKEN", None)
 os.environ.pop("BM2_TOKEN", None)
