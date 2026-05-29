@@ -926,7 +926,7 @@ body.show-delete .delete-btn{display:flex}
         <path d="M13 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-2"/>
       </svg>
       Salir
-    </a>
+    </a> 
   </div>
 </div>
 
